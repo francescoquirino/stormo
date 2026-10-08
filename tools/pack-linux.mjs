@@ -175,6 +175,22 @@ if [ "$(id -u)" = "0" ]; then
 fi
 SELF=$(readlink -f -- "$0" 2>/dev/null) || SELF=$0
 DIR=$(cd -- "$(dirname -- "$SELF")" && pwd)
+# Ubuntu 24.04+ restricts unprivileged user namespaces for unconfined processes: Electron's sandbox then
+# needs a setuid-root chrome-sandbox. Explain it instead of dying silently (never disable the sandbox).
+SB="$DIR/chrome-sandbox"
+if [ "$(cat /proc/self/attr/current 2>/dev/null)" = "unconfined" ] \\
+   && [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ] \\
+   && { [ ! -u "$SB" ] || [ "$(stat -c %u "$SB" 2>/dev/null)" != "0" ]; }; then
+  MSG="Stormo cannot start its sandbox on this system yet. Run once in a terminal:
+
+sudo chown root:root \\"$SB\\" && sudo chmod 4755 \\"$SB\\"
+
+(or install the .deb package, which does this for you), then start Stormo again."
+  echo "$MSG" >&2
+  if command -v zenity >/dev/null 2>&1; then zenity --error --title="Stormo" --width=560 --text="$MSG" 2>/dev/null
+  elif command -v notify-send >/dev/null 2>&1; then notify-send "Stormo" "$MSG"; fi
+  exit 1
+fi
 exec "$DIR/stormo" "$@"
 `;
   const launcherPath = path.join(outDir, 'Stormo');

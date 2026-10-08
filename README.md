@@ -75,6 +75,12 @@ tar xzf Stormo-1.0.0-linux-x64.tar.gz
 ./Stormo-linux-x64/Stormo
 ```
 
+> **Ubuntu 24.04+** (and other distros that restrict unprivileged user namespaces): Electron's sandbox needs the
+> `chrome-sandbox` helper to be setuid root. Either install the **`.deb`** from the release, which takes care of it
+> (`sudo apt install ./stormo_1.0.0_amd64.deb`), or for the portable build run once:
+> `sudo chown root:root Stormo-linux-x64/chrome-sandbox && sudo chmod 4755 Stormo-linux-x64/chrome-sandbox`.
+> Stormo tells you this itself if it cannot start. It never disables the sandbox.
+
 On first launch: the trailer plays (skippable), Stormo shows which CLIs it found and how to sign in or install the
 missing ones, then asks whether to give the model router to your providers. You can replay the setup anytime from
 **Settings**.
