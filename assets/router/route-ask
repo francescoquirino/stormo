@@ -1,0 +1,1561 @@
+#!/usr/bin/env python3
+"""Quota-aware model router: A projects, B complex development, C development,
+BC C development plus exactly one B reviewer (at most two C corrections).
+Use --work A|B|C|BC. Model availability never changes the assigned role.
+Legacy --code means BC unless a single tier is locked. No cross-tier boost.
+
+Windows and Linux share the same core, so Stormo's
+Auto Mode behaves the same on both. Kept from the Linux router: the free
+local models at the head of C (a model that is off exits 3 and the next one
+runs), --design (Astra proposes, a different model contests: Astra exists only
+there, never in a tier), --budget, the lead symmetry (in a `glm` session z.ai
+is the lead and is never dispatched; Claude calls strip ANTHROPIC_*), Codex's
+lean context, local_only in ~/.route/config.json, --grade/--report.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from route_budget import zai_usage, choose_balanced, effort_for
+
+# Windows defaults every text stream to the legacy ANSI codepage (cp1252 on an
+# Italian install), so a UTF-8 session log raises UnicodeDecodeError on read and
+# a model's answer can raise UnicodeEncodeError on print. Pin the pipes here;
+# every open() below states its encoding for the same reason.
+if os.name == "nt":
+    for _stream in (sys.stdin, sys.stdout, sys.stderr):
+        if _stream is not None:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+
+ROUTE_DIR = Path.home() / ".route"
+LEDGER = ROUTE_DIR / "ledger.jsonl"
+CONFIG = ROUTE_DIR / "config.json"
+
+WINDOW_5H = 5 * 3600
+WINDOW_7D = 7 * 86400
+
+# Model tiers. Same-tier availability fallback only.
+MODELS: dict[str, dict] = {
+    # Opus 5.5 / Sonnet 5.5 (Antigravity): the same Claude models served by
+    # Antigravity, on their OWN quota (separate from the Gemini models and from
+    # the Claude subscription). Estimated cap: see "antigravity" in DEFAULT_CONFIG.
+    # Listed before the native Claude models so the Claude window is spared.
+    "claude-opus-5-5-antigravity": {"account": "antigravity", "tier": "A", "runner": "agy",
+                                    "slug_base": "claude-opus-5-5", "label": "Opus 5.5 (Antigravity)"},
+    "claude-opus-5-5": {"account": "claude", "tier": "A", "runner": "claude"},
+    "claude-sonnet-5-5-antigravity": {"account": "antigravity", "tier": "B", "runner": "agy",
+                                      "slug_base": "claude-sonnet-5-5", "label": "Sonnet 5.5 (Antigravity)"},
+    "claude-sonnet-5-5": {"account": "claude", "tier": "B", "runner": "claude"},
+    "gpt-6.1-sol": {"account": "openai", "tier": "B", "runner": "codex"},
+    # Haiku 5.5 (native Claude, same quota as Sonnet 5.5): listed AFTER Sonnet, so it is
+    # the fallback inside B (chosen when Sonnet is refused by the account) or -m/--reviewer.
+    # no_lead: never a coordinator; the coordinator is Sonnet 5.5 or GPT-6.1 Sol (regia rule).
+    "claude-haiku-5-5": {"account": "claude", "tier": "B", "runner": "claude", "no_lead": True},
+    # Linux only: the free local models (an optional local model server),
+    # first in C so a task they can handle spares every paid window. The
+    # local server holds ONE model at a time: the ones that are off exit 3
+    # and the router moves on by itself. Fixed order: Ornith,
+    # Bonsai, then qwen36.
+    "ornith-locale": {"account": "locale", "tier": "C", "runner": "locale"},
+    "bonsai-locale": {"account": "locale", "tier": "C", "runner": "locale"},
+    "qwen36-locale": {"account": "locale", "tier": "C", "runner": "locale"},
+    "glm-5.3-flash": {"account": "zai", "tier": "C", "runner": "glm"},
+    "gpt-6-luna": {"account": "openai", "tier": "C", "runner": "codex"},
+    # The architect: used ONLY by --design (gated by astra_allowed), never in
+    # a tier, so -m/--planner/--writer/--reviewer refuse it like a removed model.
+    "gpt-6-astra": {"account": "openai", "tier": "A", "runner": "codex", "design_only": True},
+}
+ARCHITECT = "gpt-6-astra"
+LOCAL_MODELS = tuple(m for m, s in MODELS.items() if s["runner"] == "locale")
+
+
+def lead_provider() -> str:
+    """Which subscription runs THIS orchestrating session (from ANTHROPIC_BASE_URL).
+
+    The `glm` wrapper and `code-glm` point it at z.ai; unset or Anthropic's
+    own host means a normal Claude session.
+    """
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if base_url and "api.anthropic.com" not in base_url and "z.ai" in base_url:
+        return "zai"
+    return "claude"
+
+
+def anthropic_env() -> dict[str, str]:
+    """Environment that reaches the REAL Claude whatever session we run in.
+
+    Inside a `glm` session every ANTHROPIC_* variable points at z.ai, so a bare
+    `claude` would loop back to GLM wearing a Claude name. CLAUDE_ROUTE_GUARD
+    keeps the child's own hook from spawning a /usage probe (see run_guard).
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")}
+    env["CLAUDE_ROUTE_GUARD"] = "1"
+    return env
+
+
+def dispatchable(model: str) -> bool:
+    """A model -m/--planner/--writer/--reviewer may name: in a tier, not the lead's."""
+    spec = MODELS.get(model)
+    lead = lead_provider()
+    return bool(spec) and not spec.get("design_only") and not (
+        spec["account"] == lead and lead != "claude")
+
+
+TIERS = {t: [m for m, spec in MODELS.items() if spec["tier"] == t and dispatchable(m)]
+         for t in "ABC"}
+ACCOUNT = {m: spec["account"] for m, spec in MODELS.items()}
+TIER_NAME = {"A": "design", "B": "complex development / review", "C": "cheap and fast development"}
+
+ONLY_TIER_ENV = "ROUTE_ONLY_TIER"
+
+
+def resolve_only_tier(cli_value: str | None) -> str | None:
+    """The tier this run is locked to, or None for the normal policy.
+
+    --only-tier wins over the environment. An unrecognised value is an error,
+    never a silently lifted lock: a typo must not turn HIGH mode into "use
+    anything".
+    """
+    raw = cli_value if cli_value is not None else os.environ.get(ONLY_TIER_ENV, "")
+    value = raw.strip().upper()
+    if value in ("", "AUTO"):
+        return None
+    if value in TIERS:
+        return value
+    raise ValueError(f"{ONLY_TIER_ENV} / --only-tier must be A, B, C or auto, not '{raw}'")
+
+
+def lock_note(only: str) -> str:
+    return (f"tier {only} locked ({ONLY_TIER_ENV}): only tier {only} models "
+            f"({TIER_NAME[only]}), no fallback to other tiers")
+
+POLICY = {"easy": TIERS["C"], "med": TIERS["B"], "hard": TIERS["A"]}
+
+# Pacing thresholds (utilization of the tightest window, 0..1):
+#   < BOOST_T    surplus -> promote the task one class up ("spingi")
+#   > THROTTLE_T hot     -> prefer a fresher account at equal tier ("rallenta")
+# FRESH_T is what "fresher" means for the swap to be worth it.
+BOOST_T = 0.50
+THROTTLE_T = 0.85
+FRESH_T = 0.60
+CLASS_UP = {"easy": "med", "med": "hard", "hard": "hard"}
+
+# Reasoning effort, applied where the CLI exposes the knob (Codex). Low effort
+# on easy tasks burns less of the shared window; xhigh is reserved for the
+# tier-A work that justified a frontier model. A B model standing in for a
+# hard task gets high, not xhigh. GLM: thinking is always on (no knob via
+# glm-ask). Gemini: the -high slug is already the pick.
+CODEX_EFFORT = {"easy": "low", "med": "medium", "hard": "xhigh"}
+CODEX_EFFORT_B_HARD = "high"
+# Antigravity carries the effort in the model slug (claude-opus-5-5-low|medium|high).
+AGY_EFFORT = {"low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high"}
+# The Claude models on Antigravity are agents: left alone, Opus tries to run a
+# shell command to test its code, headless mode auto-denies it and NO output
+# comes back (empty answer, exit 0). Reading files stays allowed.
+AGY_NO_SHELL = ("RULE: respond directly in text. Do not run shell commands "
+                "(they are disabled in this session): write the result without testing it.\n\n")
+# agy has NO read-only switch: given a coding
+# task it wrote the file straight to disk and printed nothing, also under
+# --sandbox and --mode plan. This instruction is the only defence left: an
+# instruction, not a lock.
+AGY_READ_ONLY = ("FIXED RULE: you are in READ-ONLY mode. Do not create, modify or "
+                 "delete any file: you may only read. Write the entire result (code "
+                 "included) here in the response, where whoever called you will "
+                 "apply it.\n")
+PLANNER_EFFORT = {"A": "xhigh", "B": "high"}  # the plan is where thought goes
+WRITER_EFFORT = "medium"  # typing a finished plan needs little reasoning
+
+# Latency ranking for --fast (lower = faster to first useful answer).
+SPEED_RANK = {"A": 2, "B": 1, "C": 0}
+
+# Role instructions for --code. The planner does all the deciding so a small
+# model can type the result without inventing anything; the writer executes
+# and flags gaps instead of redesigning.
+PLANNER_ROLE = """\
+# Your role: PLANNER (not writer)
+
+Do not write the complete code: a smaller, faster model will write it after
+you, executing your plan to the letter without being able to ask questions.
+So every decision must already be made here. Deliver:
+
+1. **Goal** in 2-3 lines and what is out of scope.
+2. **Files to create or modify**, one by one, with the full path.
+3. For each file: the **functions/classes** with exact signature (names, parameters,
+   types, return value) and the **step-by-step logic** in precise pseudocode.
+   Where a line is delicate (formula, regex, query, API call with exact
+   parameters) write it out in full: that must not be left to guesswork.
+4. **Edge cases** to handle, one per line (empty, zero, null, threshold, double
+   execution) and what must happen in each.
+5. **Style to follow**: language, existing libraries to use, names,
+   conventions of the surrounding code. No new dependency unless
+   essential, and say so if one is needed.
+6. **How to verify**: the tests or commands to run and the expected result.
+
+If you are missing information to decide, write down the assumption you make.
+"""
+
+WRITER_ROLE = """\
+# Your role: CODE WRITER
+
+A larger model has already designed everything: you will find the plan below,
+after the original task. Your job is to turn it into complete, working
+code, **exactly as described**.
+
+- Follow the plan to the letter: same files, names, signatures, logic and edge cases.
+- Do not redesign and do not add functions the plan does not ask for.
+- Write whole files or complete blocks, never "..." or "rest unchanged" inside
+  the new code. Each block starts with the file path.
+- If the plan has a gap or a contradiction, do NOT invent: put a
+  `DOUBT:` comment at the exact spot and repeat it in the final summary.
+"""
+
+REVIEW_ROLE = """\
+# Your role: REVIEWER of code written following YOUR plan
+
+Below you will find the task, the plan you wrote, and the code produced by
+a smaller model. Check only this: does the code follow the plan?
+Are there bugs, missing edge cases, syntax errors, invented parts?
+For each problem: file, line or function, what is wrong, the exact
+fix. If everything is correct write "NO PROBLEMS" and why. Do not rewrite
+the entire code.
+"""
+
+# Estimated caps (requests per window), tunable in ~/.route/config.json.
+# reserve = fraction of the 5h window that only "hard" tasks may touch.
+DEFAULT_CONFIG = {
+    "zai": {"per_5h": 100, "per_week": None, "reserve": 0.0},
+    "openai": {"per_5h": 30, "per_week": 150, "reserve": 0.3},
+    "google": {"per_5h": 100, "per_week": None, "reserve": 0.0},
+    # Claude models on Antigravity: estimated cap of 100 calls per 5h and per week
+    # (tune it in ~/.route/config.json). The provider's own 429 (cooldown) stays
+    # the authoritative signal.
+    "antigravity": {"per_5h": 100, "per_week": 100, "reserve": 0.0},
+    # claude: gated by its REAL /usage meter (guard_* thresholds below), so
+    # the ledger caps stay off; the router stops before the session starves.
+    "claude": {"per_5h": None, "per_week": None, "reserve": 0.0},
+    # Linux: local models on the optional local GPU server, free and unmetered.
+    # The ledger still records each dispatch (to see how much work stays in-house).
+    "locale": {"per_5h": 1_000_000, "per_week": None, "reserve": 0.0},
+    "local_only": False,  # true: only qwen36-locale, no cloud provider at all
+    # Astra (--design only) is refused when the OpenAI 7-day meter is ABOVE this.
+    "astra_max_week_percent": 60,
+    "astra_effort": "high",
+    "cooldown_seconds": 3600,
+    "long_brief_bytes": 200_000,  # oltre questa taglia: gemini (long-context)
+    "gemini_runner": "auto",  # auto | agy | gemini-cli
+    "agy_slugs": {},  # per-model override of MODELS[...]["slug"], e.g. -low
+    "agy_path": None,  # override; otherwise auto-detected
+    "preamble": None,  # override; otherwise ~/.route/preamble.md
+    "guard_session_percent": 90,  # --guard warns at this session usage
+    "guard_week_percent": 80,  # --guard warns at this weekly usage
+}
+
+ZAI_TZ_OFFSET_HOURS = 8  # z.ai stamps its reset time in China time (UTC+8)
+
+# A model this account cannot use at all (e.g. a brand-new one the ChatGPT login
+# is not entitled to yet). Nothing was generated or spent, so the next candidate
+# may run. Unlike a quota error this sets NO cooldown: it is about one model,
+# and a cooldown is per account.
+UNAVAILABLE_RE = re.compile(
+    r"(?i)(not supported when using codex|unknown model|invalid model|"
+    r"model[^\n]{0,80}(?:not found|does not exist|is not available|unavailable))"
+)
+
+QUOTA_RE = re.compile(
+    r"(?i)(429|rate.?limit|too many requests|quota|usage.?limit|exhausted|"
+    r"insufficient.+balance|upgrade.+plan)"
+)
+
+# A refused request is NOT a spent one: a broken key or login must not park a
+# healthy account in cooldown for an hour. Checked only on failure, and only
+# when QUOTA_RE does not already match.
+AUTH_RE = re.compile(r"(?i)(401|403|authentication|unauthorized|invalid.+key|not logged in)")
+
+# Lean context for headless Codex dispatches (reduces the initial prompt;
+# check it with `codex debug prompt-input`). Only for THIS
+# process: ~/.codex/config.toml is not touched.
+CODEX_LEAN_ARGS = [
+    "-c", "skills.include_instructions=false",
+    "-c", "mcp_servers.node_repl.enabled=false",
+    "-c", "mcp_servers.computer-use-linux.enabled=false",
+    "-c", 'plugins."browser@openai-bundled".enabled=false',
+    "-c", 'plugins."chrome@openai-bundled".enabled=false',
+    "-c", 'plugins."unified-computer-use@openai-bundled".enabled=false',
+    "-c", 'plugins."visualize@openai-bundled".enabled=false',
+] if os.name != "nt" else []
+
+# Set by main() from --budget: the share of the account's window each delegated
+# call is told to stay within (written at the head of its brief).
+BUDGET_PCT: float | None = None
+
+
+def _merge(base: dict, override: dict) -> dict:
+    """Recursive merge: a partial {"openai": {"reserve": 0.4}} must not wipe
+    the sibling keys (a shallow update did, and crashed on the next read)."""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config() -> dict:
+    if not CONFIG.exists():
+        ROUTE_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n",
+                      encoding="utf-8")
+    return _merge(DEFAULT_CONFIG, json.loads(CONFIG.read_text(encoding="utf-8")))
+
+
+def load_preamble(cfg: dict) -> str:
+    """The working method every delegated model must follow, if installed.
+
+    Claude reads these answers and applies them, so the delegated model has to
+    mark confirmed vs inferred and refuse to invent — the same discipline the
+    orchestrating session works under. Absent file: no preamble, no error.
+    """
+    path = Path(cfg.get("preamble") or (ROUTE_DIR / "preamble.md"))
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+# Only the Claude models served by Antigravity get the token diet: NOT the
+# interactive session and NOT the native Claude models.
+TOKEN_DIET_MODELS = ("claude-opus-5-5-antigravity", "claude-sonnet-5-5-antigravity")
+
+
+def gets_token_diet(model: str) -> bool:
+    return model in TOKEN_DIET_MODELS
+
+
+def load_token_diet() -> str:
+    """The token diet (~/.route/token-diet.md) for the Antigravity Opus/Sonnet.
+
+    Read at every call so editing the file changes the next brief. A front
+    matter, if present, is dropped. ROUTE_NO_TOKEN_DIET=1 switches it off; a
+    missing file adds nothing.
+    """
+    if os.environ.get("ROUTE_NO_TOKEN_DIET"):
+        return ""
+    path = ROUTE_DIR / "token-diet.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return re.sub(r"^\ufeff?---\r?\n.*?\r?\n---\r?\n", "", text, count=1, flags=re.S).strip()
+
+
+def read_ledger() -> list[dict]:
+    if not LEDGER.exists():
+        return []
+    rows = []
+    for line in LEDGER.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a torn write must not brick the router
+    return rows
+
+
+def append_ledger(row: dict) -> None:
+    ROUTE_DIR.mkdir(parents=True, exist_ok=True)
+    with LEDGER.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def usage(rows: list[dict], account: str, now: float) -> tuple[int, int, float]:
+    """Return (used_5h, used_7d, cooldown_until) for an account."""
+    used_5h = used_7d = 0
+    cooldown_until = 0.0
+    for row in rows:
+        if row.get("account") != account:
+            continue
+        ts = row.get("ts", 0)
+        if row.get("event") == "dispatch":
+            if now - ts <= WINDOW_5H:
+                used_5h += 1
+            if now - ts <= WINDOW_7D:
+                used_7d += 1
+        elif row.get("event") == "limited":
+            cooldown_until = max(cooldown_until, row.get("until", 0))
+    return used_5h, used_7d, cooldown_until
+
+
+_CODEX_LIMITS_CACHE: dict = {"scanned": False, "value": None}
+
+
+def _find_key(obj, key: str):
+    """Depth-first search for a key in nested dicts/lists."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            found = _find_key(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_key(v, key)
+            if found is not None:
+                return found
+    return None
+
+
+def codex_real_limits() -> dict | None:
+    """Provider-REPORTED usage that Codex CLI writes into its session logs.
+
+    Unlike the ledger (a local estimate), this is OpenAI's own meter:
+    {"primary": {"used_percent": .., "window_minutes": .., "resets_at": ..}}.
+    Newest recent session wins; stale data (>24h) is ignored.
+    """
+    if _CODEX_LIMITS_CACHE["scanned"]:
+        return _CODEX_LIMITS_CACHE["value"]
+    _CODEX_LIMITS_CACHE["scanned"] = True
+    sessions = Path.home() / ".codex" / "sessions"
+    try:
+        files = sorted(sessions.rglob("*.jsonl"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    except OSError:
+        return None
+    for path in files:
+        if time.time() - path.stat().st_mtime > 24 * 3600:
+            break
+        last = None
+        try:
+            for line in path.open(encoding="utf-8", errors="replace"):
+                if '"rate_limits"' not in line:
+                    continue
+                try:
+                    rl = _find_key(json.loads(line), "rate_limits")
+                except json.JSONDecodeError:
+                    continue
+                if rl:
+                    last = rl
+        except OSError:
+            continue
+        if last:
+            _CODEX_LIMITS_CACHE["value"] = last
+            return last
+    return None
+
+
+def codex_week_window() -> dict:
+    """The 7-day slot of the real OpenAI meter, or {} if there is none.
+
+    Picked by window length, never by slot name: OpenAI reorders them (until
+    a while "primary" was the week; later it became the 5h window).
+    """
+    rl = codex_real_limits() or {}
+    for slot in ("primary", "secondary"):
+        data = rl.get(slot) or {}
+        if (data.get("used_percent") is not None
+                and (data.get("window_minutes") or 0) >= 1440):
+            return data
+    return {}
+
+
+def astra_allowed(cfg: dict, rows: list[dict], now: float) -> tuple[bool, str]:
+    """Is the architect affordable? Refused above astra_max_week_percent of the
+    OpenAI week (real Codex meter, ledger estimate otherwise). Unknown: allowed,
+    the provider's rate-limit error stays the authoritative stop."""
+    limit = cfg.get("astra_max_week_percent", 60) / 100.0
+    week = codex_week_window()
+    if week:
+        p, source = week["used_percent"] / 100.0, "real Codex meter"
+    elif cfg["openai"].get("per_week"):
+        p, source = usage(rows, "openai", now)[1] / cfg["openai"]["per_week"], "ledger estimate"
+    else:
+        return True, "openai 7-day window unknown: Astra allowed"
+    if p > limit:
+        return False, f"Astra DENIED: openai 7d at {p:.0%} > {limit:.0%} ({source})"
+    return True, f"Astra allowed: openai 7d at {p:.0%} <= {limit:.0%} ({source})"
+
+
+def budget_note(cfg: dict, rows: list[dict], model: str, percent: float, now: float) -> str:
+    """The usage cap, written at the head of the brief (--budget).
+
+    A delegate cannot read its own meter from inside `codex exec`: we tell it,
+    with the REAL number when there is one. It is an instruction, not a lock,
+    so it also says what to do when the budget is not enough.
+    """
+    account = ACCOUNT[model]
+    status = ""
+    if account == "openai":
+        w = codex_week_window()
+        if w.get("used_percent") is not None:
+            when = ""
+            if w.get("resets_at"):
+                when = " and it resets on " + time.strftime(
+                    "%d/%m at %H:%M", time.localtime(w["resets_at"]))
+            days = round((w.get("window_minutes") or 0) / 1440)
+            status = f" Right now the {days}-day window is at {w['used_percent']:.0f}%{when}."
+    if not status:
+        status = (f" Right now the {account} account is at "
+                 f"{pressure(cfg, rows, account, now) * 100:.0f}% (local estimate).")
+    return ("# Usage budget — read this before starting\n"
+            f"This task must stay within {percent:g}% of the {account} window.{status}\n"
+            "So: no broad exploring, read only the files you really need, "
+            "do not rewrite what was not asked, and keep the answer short.\n"
+            "If you realize the budget is not enough to do the job well, STOP and say so, "
+            "with what you did and what is missing: blowing the budget silently is the worst mistake.")
+
+
+CLAUDE_USAGE_CACHE = ROUTE_DIR / "claude-usage.json"
+CLAUDE_USAGE_TTL = 900  # 15 min — each refresh costs one (cheap) request
+
+
+def claude_usage(max_age: int = CLAUDE_USAGE_TTL) -> dict | None:
+    """The percentages Claude Code's own /usage reports, cached on disk.
+
+    Those numbers live on the server and are written nowhere locally — but the
+    slash command answers in headless mode too, so `claude -p "/usage"` yields
+    them. That costs one request, hence the cache and the cheapest model (the
+    figures are account-wide, not per-model).
+
+    Never route this through Git Bash: msys rewrites the argument "/usage"
+    into a path (C:/Program Files/Git/usage) before claude ever sees it, and
+    the answer comes back as a puzzled question about that file.
+    """
+    if CLAUDE_USAGE_CACHE.exists():
+        try:
+            cached = json.loads(CLAUDE_USAGE_CACHE.read_text(encoding="utf-8"))
+            if time.time() - cached.get("ts", 0) < max_age:
+                return cached
+        except (json.JSONDecodeError, OSError):
+            pass
+    exe = Path.home() / ".local" / "bin" / "claude.exe"
+    claude = str(exe) if exe.exists() else resolve_exe("claude")
+    if not claude:
+        return None
+    try:
+        out = subprocess.run(
+            [claude, "-p", "/usage", "--model", "claude-haiku-4-5-20251001"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=15,
+            # The probe is itself a Claude Code session, so it fires the very
+            # hook that may have called us. The marker lets run_guard() bail
+            # out inside the child instead of spawning probes forever.
+            # anthropic_env() also reads the REAL Claude window from inside a
+            # glm session (where ANTHROPIC_* points at z.ai).
+            env=anthropic_env()).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    windows = [
+        {"label": label.strip(), "percent": int(pct), "resets": (reset or "").strip()}
+        for label, pct, reset in re.findall(
+            r"Current ([^:\n]+): (\d+)% used(?:[^\n]*?resets ([^(\n]+))?", out)]
+    if not windows:
+        return None  # unparsed: do not cache a shape we did not understand
+    result = {"ts": time.time(), "windows": windows}
+    ROUTE_DIR.mkdir(parents=True, exist_ok=True)
+    CLAUDE_USAGE_CACHE.write_text(json.dumps(result, indent=2) + "\n",
+                                  encoding="utf-8")
+    return result
+
+
+def claude_window_tokens() -> tuple[int, int]:
+    """(output_tokens, messages) of THIS machine's Claude Code in the last 5h.
+
+    Measured from the local session JSONL (the same source ccusage parses).
+    No official cap is exposed, so this is informational: it makes the Claude
+    window visible next to the delegated providers.
+    """
+    from datetime import datetime
+    base = Path.home() / ".claude" / "projects"
+    now = time.time()
+    tokens = msgs = 0
+    try:
+        candidates = [p for p in base.rglob("*.jsonl")
+                      if now - p.stat().st_mtime <= WINDOW_5H]
+    except OSError:
+        return 0, 0
+    for path in candidates:
+        try:
+            for line in path.open(encoding="utf-8", errors="replace"):
+                if '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = d.get("timestamp")
+                if not ts:
+                    continue
+                try:
+                    t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+                if now - t > WINDOW_5H:
+                    continue
+                u = (d.get("message") or {}).get("usage") or {}
+                tokens += u.get("output_tokens", 0)
+                msgs += 1
+        except OSError:
+            continue
+    return tokens, msgs
+
+
+def pressure(cfg: dict, rows: list[dict], account: str, now: float) -> float:
+    """Utilization 0..1+ of the tightest window for this account.
+
+    For openai, the ledger estimate is corrected upward by the REAL meter
+    OpenAI reports through Codex CLI session logs (never downward: the ledger
+    may know about very recent calls the log doesn't show yet).
+    """
+    acct_cfg = cfg[account]
+    used_5h, used_7d, _ = usage(rows, account, now)
+    p5 = used_5h / acct_cfg["per_5h"] if acct_cfg["per_5h"] else 0.0
+    cap_week = acct_cfg.get("per_week")
+    pw = used_7d / cap_week if cap_week else 0.0
+    p = max(p5, pw)
+    if account == "openai":
+        rl = codex_real_limits() or {}
+        for slot in ("primary", "secondary"):
+            real = (rl.get(slot) or {}).get("used_percent")
+            if real is not None:
+                p = max(p, real / 100.0)
+    elif account == "claude":
+        real = claude_real_percents()
+        # unknown meter reads as full: never spend Claude blind
+        p = max(p, max(real) / 100.0) if real else 1.0
+    elif account == "zai":
+        real = zai_usage(ROUTE_DIR)
+        if real:
+            p = max(p, max(w['percent'] for w in real['windows']) / 100.0)
+    return p
+
+
+def claude_real_percents() -> tuple[int, int] | None:
+    """(session %, all-models week %) from /usage, or None if unreadable."""
+    data = claude_usage()
+    if not data:
+        return None
+    session = week = None
+    for window in data["windows"]:
+        if window["label"].startswith("session"):
+            session = window["percent"]
+        elif window["label"].startswith("week (all"):
+            week = window["percent"]
+    if session is None and week is None:
+        return None
+    return session or 0, week or 0
+
+
+def paced_candidates(cfg: dict, rows: list[dict], task_class: str,
+                     now: float, policy: dict[str, list[str]] = POLICY
+                     ) -> tuple[str, list[str], list[str]]:
+    """Apply the burn-rate controller to a static policy.
+
+    Returns (effective_class, candidates, notes). Boost: if the top model of
+    the class above sits on an account with real surplus, this task is
+    promoted there. Throttle: a candidate on a hot account is deferred to
+    last resort when a clearly fresher account follows at a lower tier.
+    """
+    notes: list[str] = []
+    effective = task_class
+    candidates = list(policy[effective])
+    use: list[str] = []
+    deferred: list[str] = []
+    for i, model in enumerate(candidates):
+        p = pressure(cfg, rows, ACCOUNT[model], now)
+        fresher_later = any(
+            pressure(cfg, rows, ACCOUNT[m], now) < FRESH_T
+            for m in candidates[i + 1:])
+        if p > THROTTLE_T and fresher_later:
+            deferred.append(model)
+            notes.append(f"slow down: {model} deferred "
+                         f"({ACCOUNT[model]} at {p:.0%}, a fresher account follows)")
+        else:
+            use.append(model)
+    return effective, use + deferred, notes
+
+
+def has_headroom(cfg: dict, rows: list[dict], model: str, task_class: str,
+                 now: float) -> tuple[bool, str]:
+    account = ACCOUNT[model]
+    acct_cfg = cfg[account]
+    used_5h, used_7d, cooldown_until = usage(rows, account, now)
+    if now < cooldown_until:
+        at = time.strftime('%H:%M', time.localtime(cooldown_until))
+        return False, f"{account} in cooldown until {at}"
+    if model == ARCHITECT:
+        allowed, reason = astra_allowed(cfg, rows, now)
+        if not allowed:
+            return False, reason
+    if account == "claude":
+        # Same thresholds as the --guard warning: delegation stops exactly
+        # where the orchestrating session starts to be at risk.
+        real = claude_real_percents()
+        if real is None:
+            return False, "claude: /usage unreadable, not spending blind"
+        session, week = real
+        if session >= cfg.get("guard_session_percent", 90):
+            return False, f"claude session at {session}% (reserved for Claude-lead)"
+        if week >= cfg.get("guard_week_percent", 80):
+            return False, f"claude week at {week}% (reserved for Claude-lead)"
+        return True, ""
+    if account == "zai":
+        real = zai_usage(ROUTE_DIR)
+        if real and any(w['percent'] >= 95 for w in real['windows']):
+            return False, "zai: real quota near the limit (5% reserve)"
+    cap_5h = acct_cfg["per_5h"]
+    reserved = MODELS[model]["tier"] == "C" and acct_cfg.get("reserve", 0) > 0
+    if reserved:
+        cap_5h = int(cap_5h * (1 - acct_cfg["reserve"]))
+    if used_5h >= cap_5h:
+        suffix = " (tier C quota: the rest is reserved for Sol (tier B))" if reserved else ""
+        return False, f"{account} 5h: {used_5h}/{cap_5h} exhausted{suffix}"
+    cap_week = acct_cfg.get("per_week")
+    if cap_week is not None and used_7d >= cap_week:
+        return False, f"{account} week: {used_7d}/{cap_week} exhausted"
+    if account == "openai":
+        # The ledger only counts this router's calls; OpenAI's own meter also
+        # sees Codex used by hand, so it gates too (the ledger can be far below
+        # the real usage).
+        rl = codex_real_limits() or {}
+        limit = min(1 - acct_cfg.get("reserve", 0) if reserved else 1.0,
+                    cfg.get('guard_openai_percent',95)/100.0)
+        for slot in ("primary", "secondary"):
+            real = (rl.get(slot) or {}).get("used_percent")
+            if real is not None and real / 100.0 >= limit:
+                suffix = " (the rest is reserved for tier B)" if reserved else ""
+                return False, f"openai REAL {real:.0f}% ({slot}){suffix}"
+    return True, ""
+
+
+def agy_path(cfg: dict) -> str | None:
+    """Absolute path of the Antigravity CLI (`agy`), successor of gemini-cli.
+
+    Google retired Gemini CLI for personal accounts on 2026-06-18. The
+    Antigravity installer drops the binary under LOCALAPPDATA/agy/bin and
+    registers that folder in the user PATH of FUTURE shells only, so a plain
+    PATH lookup misses it in exactly the session that follows the install.
+    """
+    override = cfg.get("agy_path")
+    if override:
+        return override if Path(override).exists() else None
+    candidates = []
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(Path(local) / "agy" / "bin" / "agy.exe")
+    candidates.append(Path.home() / ".local" / "bin" / "agy")
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return resolve_exe("agy")
+
+
+def gemini_backend(cfg: dict) -> str:
+    """Pick the Gemini runner: agy (Antigravity CLI) or the retired gemini CLI."""
+    choice = cfg.get("gemini_runner", "auto")
+    if choice == "auto":
+        if agy_path(cfg):
+            return "agy"
+        if resolve_exe("gemini"):
+            return "gemini-cli"
+        return "none"
+    return choice
+
+
+def resolve_exe(name: str) -> str | None:
+    """Absolute path of an executable, preferring a PATHEXT match on Windows.
+
+    npm installs three shims side by side (`gemini`, `gemini.cmd`,
+    `gemini.ps1`) and shutil.which hands back the extensionless one first: that
+    is the Unix shell script, and CreateProcess rejects it with WinError 193
+    (measured on python 3.12.0, both codex and gemini). Ask for each PATHEXT
+    variant by name before falling back to the bare one.
+    """
+    if os.name == "nt" and not os.path.splitext(name)[1]:
+        for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";"):
+            found = shutil.which(name + ext.strip())
+            if found:
+                return found
+    return shutil.which(name)
+
+
+def run_capped(cmd: list[str], seconds: int, *, stdin=None, stdout=None,
+               stderr=None) -> int:
+    """Run one command under a wall-clock cap, returning 124 like coreutils.
+
+    This replaces the `timeout ...` prefix the dispatch used to build. On
+    Windows a bare "timeout" in an argv resolves to System32's pause utility,
+    because CreateProcess searches System32 before PATH (verified: it answers
+    with an invalid-syntax error), so the real command never ran.
+    """
+    exe = resolve_exe(cmd[0])
+    if exe is None:
+        return 127
+    try:
+        return subprocess.run([exe, *cmd[1:]], stdin=stdin, stdout=stdout,
+                              stderr=stderr, timeout=seconds).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+
+
+def glm_ask_cmd(brief_path: str, model: str) -> list[str]:
+    """Argv for glm-ask, run through this interpreter.
+
+    glm-ask carries a shebang but no extension: Windows cannot exec it
+    directly (WinError 193), so the interpreter goes in front. Installed as a
+    sibling of route-ask; PATH is the fallback.
+    """
+    sibling = Path(__file__).resolve().with_name("glm-ask")
+    script = str(sibling) if sibling.exists() else shutil.which("glm-ask")
+    if not script:
+        sys.exit("route-ask: glm-ask not found (neither next to route-ask nor in PATH)")
+    return [sys.executable, script, "-f", brief_path, "-m", model,
+            "-t", "32000", "--timeout", "1500"]
+
+
+def single_shot_effort(model: str, task_class: str) -> str:
+    """Codex effort for a plain dispatch: by class, high for a B stand-in."""
+    if task_class == "hard" and MODELS[model]["tier"] != "A":
+        return CODEX_EFFORT_B_HARD
+    return CODEX_EFFORT[task_class]
+
+
+def run_agy_watched(cmd: list[str], log_path: str, out, err) -> int:
+    """Run agy, but stop early when its log shows the quota is gone.
+
+    agy never reports a 429: it retries with backoff until --print-timeout,
+    then exits 0 with "returning partial output" (many minutes can be lost
+    per call). Its --log-file does name the cause, as
+    RESOURCE_EXHAUSTED lines, so after three of them the call is cut and the
+    quota error is written to stderr, where the caller's 429 check sees it.
+    The "not logged into Antigravity" lines in that log are start-up noise:
+    the keyring login succeeds a few lines later.
+    """
+    proc = subprocess.Popen(cmd, stdout=out, stderr=err)
+    deadline = time.time() + 900
+    while proc.poll() is None:
+        if time.time() > deadline:
+            proc.kill()
+            return 124
+        try:
+            hits = Path(log_path).read_text(
+                encoding="utf-8", errors="replace").count("RESOURCE_EXHAUSTED")
+        except OSError:
+            hits = 0
+        if hits >= 3:
+            proc.kill()
+            proc.wait()
+            err.write("agy: RESOURCE_EXHAUSTED (code 429) — Google quota exhausted\n")
+            err.flush()
+            return 1
+        time.sleep(2)
+    try:
+        os.unlink(log_path)
+    except OSError:
+        pass
+    return proc.returncode
+
+
+def dispatch(cfg: dict, model: str, brief_path: str, effort: str = "medium",
+             fast: bool = False, out_path: str | None = None) -> tuple[int, str]:
+    """Run one model on the brief; returns (exit_code, captured_stderr).
+
+    The answer goes to stdout live, or into out_path when a later step needs
+    to read it (the --code pipeline hands the plan to the writer).
+    """
+    err_file = tempfile.NamedTemporaryFile(
+        mode="w+", suffix=".err", prefix=f"route-{model}-", delete=False,
+        encoding="utf-8")
+    err_path = err_file.name
+    err_file.close()
+    out = open(out_path, "w", encoding="utf-8") if out_path else None
+    runner = MODELS[model]["runner"]
+
+    # Opus and Sonnet via Antigravity get the token diet in front of the brief.
+    diet_path = None
+    if gets_token_diet(model):
+        diet = load_token_diet()
+        if diet:
+            diet_path = write_brief([diet, Path(brief_path).read_text(encoding="utf-8")])
+            brief_path = diet_path
+
+    if runner == "locale":
+        # locale-ask (Linux): brief file in, answer on stdout. It exits 3 when
+        # the local server is off, and run_step moves to the next candidate.
+        # A whole file of code does not fit its 4000-token default: 12000
+        # still leaves room for the brief in a 32k context.
+        sibling = Path(__file__).resolve().with_name("locale-ask")
+        script = str(sibling) if sibling.exists() else shutil.which("locale-ask")
+        with open(err_path, "w", encoding="utf-8") as err:
+            if not script:
+                err.write("route-ask: locale-ask not found\n")
+                rc = 3
+            else:
+                rc = run_capped([sys.executable, script, "-f", brief_path,
+                                 "--modello", model.removesuffix("-locale"),
+                                 "--max-tokens", "12000"], 1800,
+                                stdout=out, stderr=err)
+    elif runner == "glm":
+        with open(err_path, "w", encoding="utf-8") as err:
+            rc = run_capped(glm_ask_cmd(brief_path, model), 1800,
+                            stdout=out, stderr=err)
+    elif runner == "codex":
+        # Codex loads ~/.codex/AGENTS.md, a file DERIVED from CLAUDE.md and the
+        # preamble (Linux): rebuild it when a source is newer.
+        sync = Path(__file__).resolve().with_name("sync-agents")
+        if sync.exists():
+            subprocess.run([sys.executable, str(sync)], stdout=sys.stderr)
+        if model == ARCHITECT:
+            effort = cfg.get("astra_effort", "high")
+        cmd = ["codex", "exec", "-c", f"model={model}",
+               "-c", f"model_reasoning_effort={effort}", *CODEX_LEAN_ARGS,
+               "--sandbox", "read-only", "--skip-git-repo-check"]
+        if out:
+            # -o writes only the final message: the plan handed to the next
+            # step must not carry Codex's progress chatter.
+            out.close()
+            out = None
+            cmd += ["-o", out_path]
+        cmd.append("-")
+        with open(brief_path, encoding="utf-8") as brief, \
+                open(err_path, "w", encoding="utf-8") as err:
+            rc = run_capped(cmd, 1800, stdin=brief,
+                            stdout=subprocess.DEVNULL if out_path else None,
+                            stderr=err)
+    elif runner == "claude":
+        # Read-only tools, like Codex's read-only sandbox. The marker keeps
+        # this child session's UserPromptSubmit hook from spawning a /usage
+        # probe of its own (see run_guard).
+        cmd = ["claude", "-p", "--model", model, "--effort", effort, "--tools", "Read,Grep,Glob",
+               "--no-session-persistence"]
+        exe = Path.home() / ".local" / "bin" / "claude.exe"
+        if exe.exists():
+            cmd[0] = str(exe)
+        with open(brief_path, encoding="utf-8") as brief,                 open(err_path, "w", encoding="utf-8") as err:
+            try:
+                rc = subprocess.run(
+                    cmd, stdin=brief, stdout=out, stderr=err, timeout=1800,
+                    env=anthropic_env()).returncode
+            except subprocess.TimeoutExpired:
+                rc = 124
+            except OSError:
+                rc = 127
+    elif runner == "agy":
+        backend = gemini_backend(cfg)
+        prompt = Path(brief_path).read_text(encoding="utf-8")
+        # The brief rides in argv (stdin is not an option: measured, `agy -p`
+        # ignores a piped prompt and answers as if none was given) and Windows
+        # caps a command line at 32767 characters.
+        too_long = os.name == "nt" and len(prompt) > 30_000
+        if backend == "agy":
+            if too_long:
+                # agy reads files itself (view_file, no permission rule needed,
+                # verified under --sandbox), so the long-context route hands
+                # over the path instead of the text. Spell out "do not search":
+                # given a bare filename it launches a recursive Get-ChildItem
+                # over the home directory, which headless mode denies.
+                prompt = (f"Open the file located exactly at "
+                          f"{brief_path} and follow the instructions it contains. "
+                          "Do not search for the file elsewhere: the path is "
+                          "already complete.")
+            spec = MODELS[model]
+            slug = (cfg.get("agy_slugs") or {}).get(model) or spec.get("slug") or (
+                f"{spec['slug_base']}-{AGY_EFFORT.get(effort, 'medium')}")
+            prompt = AGY_NO_SHELL + AGY_READ_ONLY + "\n" + prompt
+            agy_log = err_path + ".agy.log"
+            cmd = [agy_path(cfg), "-p", prompt, "--model", slug,
+                   "--print-timeout", "12m", "--sandbox", "--log-file", agy_log]
+        elif backend == "gemini-cli":
+            if too_long:
+                os.unlink(err_path)
+                if out:
+                    out.close()
+                return 1, (f"route-ask: brief of {len(prompt) // 1000}KB exceeds "
+                           "the Windows command-line limit (32KB) "
+                           "— use -m glm-5.3 or split the brief")
+            cmd = ["gemini", "-m", model, "-p", prompt]
+        else:
+            os.unlink(err_path)
+            if out:
+                out.close()
+            return 1, "route-ask: no Gemini runner (neither agy nor gemini CLI)"
+        with open(err_path, "w", encoding="utf-8") as err:
+            if backend == "agy":
+                rc = run_agy_watched(cmd, agy_log, out, err)
+            else:
+                rc = run_capped(cmd, 900, stdout=out, stderr=err)
+    else:
+        sys.exit(f"route-ask: unknown runner for {model}: {runner}")
+
+    if out:
+        out.close()
+    err_text = Path(err_path).read_text(encoding="utf-8", errors="replace") if Path(err_path).exists() else ""
+    os.unlink(err_path)
+    if diet_path:
+        try:
+            os.unlink(diet_path)
+        except OSError:
+            pass
+    return rc, err_text
+
+
+def run_guard(cfg: dict) -> None:
+    """Warn when the Claude window is nearly spent. Silent otherwise.
+
+    Built for a UserPromptSubmit hook: it prints nothing in the normal case,
+    and a JSON systemMessage when a threshold is crossed. Per-model windows
+    ("week (Fable)") are deliberately skipped — one of them sitting at 100%
+    would fire on every prompt for a day, which is exactly how a warning
+    becomes wallpaper.
+    """
+    if os.environ.get("CLAUDE_ROUTE_GUARD"):
+        return  # running inside the /usage probe this guard spawned
+    data = claude_usage()
+    if not data:
+        return
+    alerts = []
+    for window in data["windows"]:
+        label = window["label"]
+        if label.startswith("session"):
+            threshold = cfg.get("guard_session_percent", 90)
+        elif label.startswith("week (all"):
+            threshold = cfg.get("guard_week_percent", 80)
+        else:
+            continue
+        if window["percent"] >= threshold:
+            reset = f", reset {window['resets']}" if window["resets"] else ""
+            alerts.append(f"{label} at {window['percent']}%{reset}")
+    if alerts:
+        print(json.dumps({"systemMessage":
+                          "Claude window almost exhausted — " + "; ".join(alerts)
+                          + ". To continue with the same interface but on the "
+                            "z.ai plan: open a terminal and run  glm"}))
+
+
+def parse_reset_hint(err_text: str, now: float) -> float | None:
+    """Absolute epoch of the reset time a provider declares, or None.
+
+    z.ai answers a 429 with "Your limit will reset at YYYY-MM-DD HH:MM:SS" in
+    China time (UTC+8), not local time. Convert from UTC+8, then keep the
+    result only if it lands inside one 5h window: a stamp outside that range
+    is a format we no longer understand, and the flat cooldown is the safer
+    answer.
+    """
+    match = re.search(r"reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",
+                      err_text)
+    if not match:
+        return None
+    from datetime import datetime, timedelta, timezone
+    parsed = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=timezone(timedelta(hours=ZAI_TZ_OFFSET_HOURS))).timestamp()
+    return parsed if now < parsed <= now + WINDOW_5H else None
+
+
+def next_free_slot(rows: list[dict], account: str, now: float) -> float | None:
+    """Seconds until the oldest event leaves the 5h window (count decreases)."""
+    in_window = [r["ts"] for r in rows
+                 if r.get("account") == account and r.get("event") == "dispatch"
+                 and now - r.get("ts", 0) <= WINDOW_5H]
+    if not in_window:
+        return None
+    return min(in_window) + WINDOW_5H - now
+
+
+def show_status(cfg: dict, rows: list[dict]) -> None:
+    now = time.time()
+    lead = lead_provider()
+    print(f"lead of this session: {lead}" + (" (Opus/Sonnet delegatable only below the --guard thresholds)"
+          if lead == "claude" else " (not delegatable: its models are outside the tiers)"))
+    print(f"{'account':<11} {'5h':>9} {'7d':>9} {'pressure':>7}  verdict")
+    for account in ("locale", "zai", "openai", "antigravity"):
+        acct_cfg = cfg[account]
+        used_5h, used_7d, cooldown_until = usage(rows, account, now)
+        week = acct_cfg.get("per_week")
+        p = pressure(cfg, rows, account, now)
+        if now < cooldown_until:
+            at = time.strftime('%H:%M', time.localtime(cooldown_until))
+            verdict = f"COOLDOWN until {at}"
+        elif p < BOOST_T:
+            verdict = "AVAILABLE (no tier change)"
+        elif p > THROTTLE_T:
+            verdict = "SLOW DOWN (near the limit)"
+        else:
+            verdict = "OK"
+        slot = next_free_slot(rows, account, now)
+        if slot is not None and p > THROTTLE_T:
+            verdict += f" — first free slot in {int(slot // 60)} min"
+        week_str = f"{used_7d:>4}/{week}" if week is not None else f"{used_7d:>4}/—"
+        if account == "locale":
+            print(f"{account:<11} {used_5h:>4}/—    {'—':>9} {'0%':>7}  FREE (if on; off = moves to the next one)")
+            continue
+        print(f"{account:<11} {used_5h:>4}/{acct_cfg['per_5h']:<4} {week_str:>9} "
+              f"{p:>6.0%}  {verdict}")
+    print(f"architect (--design): {astra_allowed(cfg, rows, now)[1]}")
+    rl = codex_real_limits()
+    if rl:
+        parts = []
+        for slot, label in (("primary", ""), ("secondary", " (2nd window)")):
+            data = rl.get(slot) or {}
+            if data.get("used_percent") is None:
+                continue
+            win = data.get("window_minutes") or 0
+            win_str = f"{win // 1440}d" if win >= 1440 else f"{win // 60}h"
+            reset = data.get("resets_at")
+            reset_str = (" — reset " + time.strftime(
+                "%d/%m %H:%M", time.localtime(reset))) if reset else ""
+            parts.append(f"{data['used_percent']:.0f}% of {win_str}{label}{reset_str}")
+        if parts:
+            print(f"\nopenai REAL (source: Codex CLI): {'; '.join(parts)}")
+    usage_claude = claude_usage()
+    if usage_claude:
+        parts = [f"{w['label']} {w['percent']}%"
+                 + (f" (reset {w['resets']})" if w["resets"] else "")
+                 for w in usage_claude["windows"]]
+        age = int((time.time() - usage_claude["ts"]) // 60)
+        stale = f" — read {age} min ago" if age else ""
+        print(f"\nclaude REAL (source: /usage): {'; '.join(parts)}{stale}")
+    tokens, msgs = claude_window_tokens()
+    if msgs:
+        print(f"claude (this machine, last 5h): {msgs} messages, "
+              f"~{tokens / 1000:.0f}k tokens out")
+    print("\n(estimated caps, editable in ~/.route/config.json; the "
+          "authoritative signal remains the provider's rate-limit error; openai "
+          "pressure uses the real meter when available)")
+
+
+def run_step(cfg: dict, candidates: list[str], task_class: str,
+             brief_path: str, effort_for, *, forced: bool = False,
+             fast: bool = False, dry_run: bool = False, label: str = "",
+             out_path: str | None = None, balance: bool = True) -> tuple[int, str | None]:
+    """Try candidates in order until one runs; returns (exit_code, model).
+
+    A rate-limit puts that account in cooldown and falls through to the next
+    candidate. Any other failure stops here: the caller decides, because a
+    truncated answer re-run elsewhere would double-spend two accounts.
+    effort_for(model) gives the Codex reasoning effort for that candidate.
+    """
+    tag = f"[{label}] " if label else ""
+    _CODEX_LIMITS_CACHE.update(scanned=False, value=None)
+    if balance:  # --design keeps its fixed order (Astra first while allowed)
+        candidates = choose_balanced(sys.modules[__name__], cfg, candidates, task_class)
+    for model in candidates:
+        if model not in MODELS:
+            sys.exit(f"route-ask: unknown model: {model} "
+                     f"(valid: {', '.join(MODELS)})")
+        rows = read_ledger()
+        now = time.time()
+        ok, reason = has_headroom(cfg, rows, model, task_class, now)
+        if not ok and not forced:
+            print(f"route-ask: {tag}skipping {model} — {reason}", file=sys.stderr)
+            continue
+        if not ok:
+            print(f"route-ask: {tag}WARNING {reason} (forced)", file=sys.stderr)
+        tier = MODELS[model]["tier"]
+        if dry_run:
+            print(f"route-ask: {tag}[dry-run] would pick {model} (tier {tier}, "
+                  f"class {task_class}), effort {effort_for(model)}", file=sys.stderr)
+            return 0, model
+        print(f"route-ask: {tag}-> {model} (tier {tier}, class {task_class})",
+              file=sys.stderr)
+        print(f"route-ask: {tag}effort {effort_for(model)}; chosen by available quota",file=sys.stderr)
+        sent_path = brief_path
+        if BUDGET_PCT:
+            sent_path = write_brief([budget_note(cfg, rows, model, BUDGET_PCT, now),
+                                     Path(brief_path).read_text(encoding="utf-8")])
+        t0 = time.time()
+        try:
+            rc, err_text = dispatch(cfg, model, sent_path, effort_for(model),
+                                    fast=fast, out_path=out_path)
+        finally:
+            if sent_path != brief_path:
+                Path(sent_path).unlink(missing_ok=True)
+
+        # Local server off (locale-ask exits 3): neither quota nor auth. Next
+        # candidate at once, no cooldown — the free worker being off must never
+        # block the paid ones.
+        if rc == 3 and model in LOCAL_MODELS:
+            print(f"route-ask: {tag}{model} OFF (start your local model server to use it) "
+                  "— trying the next one", file=sys.stderr)
+            continue
+
+        if rc != 0 and AUTH_RE.search(err_text) and not QUOTA_RE.search(err_text):
+            print(f"route-ask: {tag}{model}: AUTHENTICATION FAILED — {ACCOUNT[model]} "
+                  f"login needs fixing (no spend), trying the next one",
+                  file=sys.stderr)
+            continue
+
+        # Only a failed exit can be a limit: on a successful run Codex's stderr also
+        # contains the model's own text, and a brief that talks about "429" or
+        # "quota" used to trigger a false cooldown. agy on exhausted
+        # quota still exits with 1 thanks to run_agy_watched().
+        if rc != 0 and QUOTA_RE.search(err_text):
+            cooldown = cfg.get("cooldown_seconds", 3600)
+            if re.search(r"(?i)week|settiman", err_text):
+                cooldown = 6 * 3600
+            until = time.time() + cooldown
+            hint = parse_reset_hint(err_text, time.time())
+            if hint:
+                until = hint
+            append_ledger({"ts": time.time(), "event": "limited",
+                           "account": ACCOUNT[model], "model": model,
+                           "until": until})
+            print(f"route-ask: {tag}{model} RATE-LIMITED — cooldown "
+                  f"{cooldown // 60} min, trying the next one", file=sys.stderr)
+            continue
+
+        if rc != 0 and not forced and UNAVAILABLE_RE.search(err_text):
+            print(f"route-ask: {tag}{model} NOT AVAILABLE with this account "
+                  "(no spend), trying the next one", file=sys.stderr)
+            continue
+
+        append_ledger({"ts": time.time(), "event": "dispatch",
+                       "account": ACCOUNT[model], "model": model,
+                       "class": task_class, "status": rc, "role": label or "ask",
+                       "brief_bytes": Path(brief_path).stat().st_size,
+                       "duration_s": round(time.time() - t0, 1),
+                       **({"budget_percent": BUDGET_PCT} if BUDGET_PCT else {})})
+        if rc != 0:
+            sys.stderr.write(err_text)
+            print(f"route-ask: {tag}{model} exited with status={rc} "
+                  "(124=timeout; no automatic retry)", file=sys.stderr)
+        return rc, model
+    return 1, None
+
+
+def write_brief(parts: list[str]) -> str:
+    """Join brief sections into a temp file and return its path."""
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", prefix="route-brief-", delete=False,
+        encoding="utf-8")
+    tmp.write("\n\n---\n\n".join(p.strip() for p in parts if p.strip()) + "\n")
+    tmp.close()
+    return tmp.name
+
+
+def ordered(candidates: list[str], first: str | None) -> list[str]:
+    """Put a forced model first; the rest stay as fallbacks."""
+    if not first:
+        return candidates
+    return [first] + [m for m in candidates if m != first]
+
+
+def quota_snapshot(cfg: dict) -> dict:
+    now = time.time()
+    rows = read_ledger()
+    providers = {}
+    def window(label, pct, reset=None):
+        return dict(label=label, used_percent=pct, remaining_percent=max(0,100-pct), resets_at=reset)
+    rl = codex_real_limits() or {}
+    ow = [window('week' if v.get('window_minutes',0) >= 10080 else '5h' if v.get('window_minutes') == 300 else str(v.get('window_minutes'))+'min',
+                 v['used_percent'],v.get('resets_at')) for v in rl.values() if isinstance(v,dict) and isinstance(v.get('used_percent'),(int,float))]
+    cw = claude_usage()
+    zw = zai_usage(ROUTE_DIR)
+    real = {'antigravity':[], 'openai':ow,'claude':[window(w['label'],w['percent'],w.get('resets')) for w in cw['windows']] if cw else [],
+            'zai':[window(w['label'],w['percent'],w.get('resets_at')) for w in zw['windows']] if zw else []}
+    for account in ('claude','openai','zai','antigravity'):
+        used5,used7,cooldown = usage(rows,account,now)
+        windows = real[account]
+        if not windows:
+            cap = cfg[account]
+            windows = [window('5h (estimate)',min(100,100*used5/cap['per_5h']))] if cap.get('per_5h') else []
+            if cap.get('per_week'): windows.append(window('week (estimate)',min(100,100*used7/cap['per_week'])))
+        providers[account] = dict(source='real' if real[account] else 'estimate', windows=windows,
+                                 pressure=pressure(cfg,rows,account,now),cooldown_until=cooldown if cooldown>now else None)
+    return {'ts':now,'providers':providers,'policy':'balance within the same tier; one B reviewer per task'}
+
+
+def show_tiers(cfg: dict, rows: list[dict], only: str | None = None) -> None:
+    now = time.time()
+    if only:
+        print(f"{lock_note(only)}\n")
+    for tier in "ABC":
+        print(f"{tier} — {TIER_NAME[tier]}")
+        for model in TIERS[tier]:
+            account = ACCOUNT[model]
+            p = pressure(cfg, rows, account, now)
+            label = MODELS[model].get("label")
+            print(f"   {model:<30} {account:<12} pressure {p:>4.0%}" + (f"   {label}" if label else ""))
+    print("\nWork: A designs; B develops complex parts; C develops routine parts;")
+    print("BC: C writes, ONE B reviewer checks, at most two returns to C.")
+    print("Minor defects: notes; final blocking defects: the same B fixes once, then real tests.")
+
+
+# --design (Linux): the architect proposes, a DIFFERENT model contests. One
+# round; the lead reads both and decides. Astra first while the OpenAI week
+# allows it, then Opus 5.5 (Antigravity spares the Claude window). Counters
+# that can READ the repo come first (Codex read-only sandbox, Claude Read).
+DESIGN_PROPOSERS = [ARCHITECT, "claude-opus-5-5-antigravity", "claude-opus-5-5"]
+DESIGN_COUNTERS = ["gpt-6.1-sol", "claude-sonnet-5-5-antigravity", "claude-sonnet-5-5"]
+
+DESIGN_PROPOSE_RULES = """# Role: architect (design proposal)
+
+Do not write code and do not modify files: design only. If you can read the
+repository, verify your claims by reading the real files. Deliver, in English:
+
+1. Goal in one sentence and an observable "done" criterion.
+2. Non-goals: what is NOT touched.
+3. Invariants and constraints the implementation must respect.
+4. The design: components, data, interfaces, order of steps. For each choice,
+   the alternative discarded and why it loses.
+5. Risks: the thing most likely to go wrong, and how it is caught.
+6. Executable proof (tests, commands, observations) demonstrating "done".
+
+Mark every load-bearing claim as VERIFIED (file:line or command run)
+or INFERRED. Do not invent what you have not read."""
+
+DESIGN_COUNTER_RULES = """# Role: challenger
+
+Below you will find a task and the design PROPOSAL written by another model.
+Do not rewrite the design from scratch and do not write code. If you can read
+the repository, check the proposal's claims against the real files.
+
+For EVERY point of the proposal answer ACCEPT (with proof) or CHALLENGE
+(with concrete evidence: file:line, command, or the condition that would falsify it).
+Then: what is missing; the most serious risk the proposal ignores; where the proposal
+is right. Close with three lists: POINTS OF AGREEMENT / POINTS OF DISAGREEMENT / TO VERIFY."""
+
+
+def run_design(cfg: dict, task: str, preamble: str, dry_run: bool, fast: bool) -> int:
+    proposers = [m for m in DESIGN_PROPOSERS if m == ARCHITECT or dispatchable(m)]
+    counters = [m for m in DESIGN_COUNTERS if dispatchable(m)]
+    if dry_run:
+        rc, proposer = run_step(cfg, proposers, "hard", "", lambda m: "medium",
+                                dry_run=True, label="proposal", balance=False)
+        if not proposer:
+            print("route-ask: no architect available", file=sys.stderr)
+            return 1
+        rc, counter = run_step(cfg, [m for m in counters if m != proposer], "hard", "",
+                               lambda m: "medium", dry_run=True, label="counter-proposal",
+                               balance=False)
+        return 0 if counter else 1
+    out_dir = ROUTE_DIR / "design" / time.strftime("%Y%m%d-%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "task.md").write_text(task, encoding="utf-8")
+    effort = lambda m: "medium" if "opus" in m else "high"
+    # No fall-through on a failed design: it is a deliberate, expensive act.
+    p_brief = write_brief([preamble, DESIGN_PROPOSE_RULES, "# The task\n\n" + task])
+    proposal = out_dir / "proposal.md"
+    rc, proposer = run_step(cfg, proposers, "hard", p_brief, effort, fast=fast,
+                            label="proposal", out_path=str(proposal), balance=False)
+    Path(p_brief).unlink(missing_ok=True)
+    text = proposal.read_text(encoding="utf-8", errors="replace").strip() if proposal.exists() else ""
+    if not proposer or rc or not text:
+        print(f"route-ask: proposal failed ({proposer}, status={rc}) — design aborted",
+              file=sys.stderr)
+        return 1
+    print(f"\n===== PROPOSAL ({proposer}) =====\n\n{text}\n")
+    c_brief = write_brief([preamble, DESIGN_COUNTER_RULES, "# The task\n\n" + task,
+                           f"# The proposal (by {proposer})\n\n{text}"])
+    counter_proposal = out_dir / "counter-proposal.md"
+    rc, counter = run_step(cfg, [m for m in counters if m != proposer], "hard", c_brief,
+                           effort, fast=fast, label="counter-proposal", out_path=str(counter_proposal),
+                           balance=False)
+    Path(c_brief).unlink(missing_ok=True)
+    text = counter_proposal.read_text(encoding="utf-8", errors="replace").strip() if counter_proposal.exists() else ""
+    if not counter or rc or not text:
+        print(f"route-ask: counter-proposal failed ({counter}, status={rc}) — "
+              f"proposal saved in {out_dir}", file=sys.stderr)
+        return 1
+    print(f"\n===== COUNTER-PROPOSAL ({counter}) =====\n\n{text}\n")
+    print(f"route-ask: design saved in {out_dir}", file=sys.stderr)
+    return 0
+
+
+def record_outcome(rows: list[dict], grade: str, note: str) -> None:
+    """--grade: attach a human verdict to the most recent dispatch."""
+    dispatches = [r for r in rows if r.get("event") == "dispatch"]
+    if not dispatches:
+        sys.exit("route-ask: no dispatch to grade in the ledger")
+    last = dispatches[-1]
+    append_ledger({"ts": time.time(), "event": "outcome", "ref_ts": last["ts"],
+                   "model": last["model"], "class": last.get("class"),
+                   "grade": grade, "note": note})
+    print(f"route-ask: outcome '{grade}' recorded for {last['model']} "
+          f"(class {last.get('class')}, {(time.time() - last['ts']) / 60:.0f} min ago)")
+
+
+def show_report(rows: list[dict], days: int) -> None:
+    """--report: per class and model, failures, timeouts, votes, median seconds."""
+    cutoff = time.time() - days * 86400
+    outcomes = {r["ref_ts"]: r["grade"] for r in rows
+                if r.get("event") == "outcome" and r.get("ts", 0) >= cutoff}
+    cells: dict[tuple, dict] = {}
+    for d in rows:
+        if d.get("event") != "dispatch" or d.get("ts", 0) < cutoff or not d.get("model"):
+            continue
+        c = cells.setdefault((d.get("class", "?"), d["model"]),
+                             {"n": 0, "err": 0, "tmo": 0, "dur": [], "ok": 0, "meh": 0, "ko": 0})
+        c["n"] += 1
+        if d.get("status") == 124:
+            c["tmo"] += 1
+        elif d.get("status") not in (0, None):
+            c["err"] += 1
+        if d.get("duration_s") is not None:
+            c["dur"].append(d["duration_s"])
+        grade = outcomes.get(d["ts"])
+        if grade:
+            c[grade] += 1
+    if not cells:
+        print(f"route-ask: no dispatch in the last {days} days")
+        return
+    print(f"Report for the last {days} days (cells with n<10 = noise).")
+    print(f"{'class':<7} {'model':<30} {'n':>4} {'ok/meh/ko':>10} {'err':>4} {'tmo':>4} {'med s':>7}")
+    for key in sorted(cells):
+        c = cells[key]
+        dur = sorted(c["dur"])
+        med = f"{dur[len(dur) // 2]:.0f}" if dur else "—"
+        print(f"{key[0]:<7} {key[1]:<30} {c['n']:>4} {c['ok']:>4}/{c['meh']}/{c['ko']} "
+              f"{c['err']:>4} {c['tmo']:>4} {med:>7}{' ·' if c['n'] < 10 else ''}")
+
+
+def main() -> None:
+    from route_workflow import run_workflow
+    parser = argparse.ArgumentParser(description="A designs, B develops/reviews, C develops; BC is C plus one B reviewer")
+    parser.add_argument("prompt", nargs="*")
+    parser.add_argument("-f", "--file")
+    parser.add_argument("-c", "--task-class", choices=["easy", "med", "hard"], default="med")
+    parser.add_argument("--work", type=str.upper, choices=["A", "B", "C", "BC"], help="work class, distinct from the model tier")
+    parser.add_argument("--difficulty", choices=["easy", "medium", "hard"], help="difficulty for Sonnet/Sol: low/medium/high; C stays max, Opus medium")
+    parser.add_argument("--usage-json", action="store_true", help="quotas per provider, real when available, declared estimates otherwise")
+    parser.add_argument("--leader-json", action="store_true", help="pick the Claude/Codex coordinator by quota")
+    parser.add_argument("-m", "--model", help="preferred model, within the work's tier")
+    parser.add_argument("--code", action="store_true", help="compatibility: BC, or the tier of the A/B/C block")
+    parser.add_argument("--review", action="store_true", help="B review: requires work BC")
+    parser.add_argument("--planner", help="A planner, only --work A")
+    parser.add_argument("--writer", help="C developer, --work C or BC")
+    parser.add_argument("--reviewer", help="single B reviewer, only --work BC")
+    parser.add_argument("--tiers", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--guard", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--fast", action="store_true", help="compatibility: respects fixed roles and effort")
+    parser.add_argument("--no-preamble", action="store_true")
+    parser.add_argument("--only-tier", type=str.upper, choices=["A", "B", "C", "AUTO"])
+    parser.add_argument("--design", action="store_true",
+                        help="Astra (if the OpenAI week allows it) or Opus proposes, another model counters")
+    parser.add_argument("--budget", type=float, metavar="PCT",
+                        help="ask the model to stay within PCT%% of the window (real meter if there is one)")
+    parser.add_argument("--grade", "--esito", dest="esito", choices=["ok", "meh", "ko"], help="grade for the LAST dispatch (for --report)")
+    parser.add_argument("--note", "--nota", dest="nota", default="", help="optional note for --grade")
+    parser.add_argument("--report", action="store_true", help="compares models per class")
+    parser.add_argument("--days", type=int, default=30, help="window for --report (default 30)")
+    args = parser.parse_args()
+    global BUDGET_PCT
+    BUDGET_PCT = args.budget
+    try:
+        inherited = resolve_only_tier(None)
+        args.only = resolve_only_tier(args.only_tier)
+        if os.environ.get("ROUTE_TIER_LOCK") == "1" and inherited and args.only != inherited:
+            parser.error(f"Stormo locks tier {inherited}: change it from the app's menu")
+    except ValueError as err:
+        parser.error(str(err))
+    cfg = load_config()
+    if args.leader_json:
+        # only who can lead a session (Claude Code or Codex): Antigravity models are sandboxed workers
+        leaders = [m for m in TIERS['B'] if MODELS[m]['runner'] in ('claude', 'codex') and not MODELS[m].get('no_lead')]
+        candidates = choose_balanced(sys.modules[__name__],cfg,leaders,'med')
+        for model in candidates:
+            ok,_ = has_headroom(cfg,read_ledger(),model,'med',time.time())
+            if ok:
+                print(json.dumps(dict(ok=True,engine='claude' if ACCOUNT[model]=='claude' else 'codex',model=model,effort='medium')))
+                return
+        print(json.dumps(dict(ok=False,error='Claude and Codex coordinator quotas insufficient; wait for the reset.')))
+        return
+    if args.usage_json:
+        print(json.dumps(quota_snapshot(cfg), ensure_ascii=False, indent=2))
+        return
+    if args.status:
+        if cfg.get("local_only"):
+            print("route-ask: local-only mode active; no cloud provider queried")
+            return
+        show_status(cfg, read_ledger())
+        return
+    if args.tiers:
+        show_tiers(cfg, read_ledger(), args.only)
+        return
+    if args.guard:
+        if not cfg.get("local_only"):
+            run_guard(cfg)
+        return
+    if args.esito:
+        record_outcome(read_ledger(), args.esito, args.nota)
+        return
+    if args.report:
+        show_report(read_ledger(), args.days)
+        return
+    if args.design:
+        if cfg.get("local_only"):
+            parser.error("--design disabled in local-only mode")
+        if args.code or args.model or args.work or args.only:
+            parser.error("--design cannot combine with --work, --code, -m or a tier lock")
+        task = (Path(args.file).read_text(encoding="utf-8-sig") if args.file
+                else " ".join(args.prompt) if args.prompt
+                else (sys.stdin.read() if not sys.stdin.isatty() else ""))
+        if not task.strip():
+            parser.error("no prompt (argument, -f, or stdin)")
+        sys.exit(run_design(cfg, task, "" if args.no_preamble else load_preamble(cfg),
+                            args.dry_run, args.fast))
+    if cfg.get("local_only"):
+        # ~/.route/config.json "local_only": true — nothing leaves this PC.
+        if args.model and args.model != "qwen36-locale":
+            parser.error("cloud provider blocked by local-only mode")
+        if args.work in ("A", "B", "BC") or args.code or args.review or args.only in ("A", "B"):
+            parser.error("local-only mode: only work C with qwen36-locale")
+        args.model, args.work = "qwen36-locale", "C"
+        print("route-ask: local-only mode: using qwen36-locale exclusively", file=sys.stderr)
+    inherited_work = os.environ.get("ROUTE_WORK_CLASS", "auto").strip().upper()
+    if inherited_work not in ("", "AUTO", "A", "B", "C", "BC"):
+        parser.error("ROUTE_WORK_CLASS must be A, B, C, BC or auto")
+    if inherited_work in ("A", "B", "C", "BC"):
+        if args.work and args.work != inherited_work:
+            parser.error(f"Stormo locks work {inherited_work}: change it from the app's menu")
+        args.work = inherited_work
+    for flag in ("model", "planner", "writer", "reviewer"):
+        model = getattr(args, flag)
+        if model and not dispatchable(model):
+            valid = [m for m in MODELS if dispatchable(m)]
+            parser.error(f"unknown model {model} (valid: {', '.join(valid)})")
+    if not args.work:
+        args.work = args.only or ("BC" if args.code or args.review else
+                                 MODELS[args.model]["tier"] if args.model else
+                                 {"easy": "C", "med": "B", "hard": "A"}[args.task_class])
+    if args.only and args.work != args.only:
+        parser.error(f"{lock_note(args.only)}; work {args.work} requires other tiers")
+    for flag, allowed in (("model", args.work), ("planner", "A"), ("writer", "C"), ("reviewer", "B")):
+        model = getattr(args, flag)
+        if model and MODELS[model]["tier"] != allowed:
+            parser.error(f"--{flag}: {model} is tier {MODELS[model]['tier']}; tier {allowed} required")
+    if args.model and args.work == "BC":
+        parser.error("in BC use --writer and --reviewer, a single B reviewer")
+    if args.planner and args.work != "A":
+        parser.error("--planner only applies to work A")
+    if args.writer and args.work not in ("C", "BC"):
+        parser.error("--writer only applies to work C/BC")
+    if (args.reviewer or args.review) and args.work != "BC":
+        parser.error("--review/--reviewer only apply to work BC")
+    if args.file:
+        task = Path(args.file).read_text(encoding="utf-8-sig")
+    else:
+        task = " ".join(args.prompt) if args.prompt else (sys.stdin.read() if not sys.stdin.isatty() else "")
+    if not task.strip():
+        parser.error("no prompt (argument, -f, or stdin)")
+    if args.only:
+        print(f"route-ask: {lock_note(args.only)}", file=sys.stderr)
+    preamble = "" if args.no_preamble else load_preamble(cfg)
+    sys.exit(run_workflow(sys.modules[__name__], cfg, args, task, preamble))
+
+
+if __name__ == "__main__":
+    main()

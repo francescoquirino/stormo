@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.qa/
+__pycache__/
+*.pyc
+*.log
+*.stormo-tmp
+.DS_Store
+tools/rcedit.exe
