@@ -3,11 +3,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/alessandroquirino-lab/stormo/releases/latest"><img src="https://img.shields.io/github/v/release/alessandroquirino-lab/stormo?style=flat-square&color=8b7cf8" alt="Latest release"></a>
+  <a href="https://github.com/francescoquirino/stormo/releases/latest"><img src="https://img.shields.io/github/v/release/francescoquirino/stormo?style=flat-square&color=8b7cf8" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platform-Linux%20x64-2bd3e6?style=flat-square" alt="Linux x64">
   <img src="https://img.shields.io/badge/license-MIT-4ade80?style=flat-square" alt="MIT license">
   <img src="https://img.shields.io/badge/built%20with-Electron-47848F?style=flat-square" alt="Electron">
-  <a href="https://github.com/alessandroquirino-lab/stormo/stargazers"><img src="https://img.shields.io/github/stars/alessandroquirino-lab/stormo?style=flat-square&color=fbbf24" alt="Stars"></a>
+  <a href="https://github.com/francescoquirino/stormo/stargazers"><img src="https://img.shields.io/github/stars/francescoquirino/stormo?style=flat-square&color=fbbf24" alt="Stars"></a>
 </p>
 
 **Claude Code, Codex, Antigravity, Gemini CLI, GitHub Copilot, Cursor Agent, Grok and GLM — in one desktop
@@ -17,8 +17,8 @@ workspace, with real terminals and the subscriptions you already pay for.** No A
   <img src="docs/screenshots/trailer.gif" alt="Stormo in action" width="820">
 </p>
 <p align="center">
-  ▶ <a href="https://github.com/alessandroquirino-lab/stormo/releases/latest">Watch the 30-second trailer</a> &nbsp;·&nbsp;
-  ⬇ <a href="https://github.com/alessandroquirino-lab/stormo/releases/latest">Download for Linux</a>
+  ▶ <a href="https://github.com/francescoquirino/stormo/releases/latest">Watch the 30-second trailer</a> &nbsp;·&nbsp;
+  ⬇ <a href="https://github.com/francescoquirino/stormo/releases/latest">Download for Linux</a>
 </p>
 
 ## Why Stormo?
@@ -70,7 +70,7 @@ file, so Stormo tells you to paste the rules by hand.
 ## Quick start (Linux x64)
 
 ```bash
-curl -LO https://github.com/alessandroquirino-lab/stormo/releases/latest/download/Stormo-1.0.0-linux-x64.tar.gz
+curl -LO https://github.com/francescoquirino/stormo/releases/latest/download/Stormo-1.0.0-linux-x64.tar.gz
 tar xzf Stormo-1.0.0-linux-x64.tar.gz
 ./Stormo-linux-x64/Stormo
 ```
@@ -92,7 +92,7 @@ Install the CLIs you want from their official sources and sign in once; Stormo p
 ## Build from source
 
 ```bash
-git clone https://github.com/alessandroquirino-lab/stormo.git
+git clone https://github.com/francescoquirino/stormo.git
 cd stormo
 npm ci
 npm start                     # run
@@ -116,7 +116,7 @@ stores or prints it.
 - [ ] Configurable local-model list for tier C
 - [ ] More providers as their CLIs ship
 
-Ideas and bug reports: [open an issue](https://github.com/alessandroquirino-lab/stormo/issues).
+Ideas and bug reports: [open an issue](https://github.com/francescoquirino/stormo/issues).
 If Stormo saves you a window or two, a ⭐ helps other people find it.
 
 ## Credits & license
